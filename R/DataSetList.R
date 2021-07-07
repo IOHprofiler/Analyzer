@@ -45,6 +45,9 @@ read_dir <- function(path, verbose = T, print_fun = NULL, maximization = TRUE,
 #'  These formats are specified in more detail in our github wiki.
 #' @param subsampling Logical. Whether *.cdat files are subsampled?
 #' @param print_fun Function used to print output when in verbose mode
+#' @param full_aggregation If True, individual DataSets are aggregated as much as possible: all DataSets
+#' with the same algorithmname, function id and dimension are combined together. This leads to information loss
+#' related to static variables, so only use if that information is not required. 
 #'
 #' @return A DataSetList object
 #' @export
@@ -52,7 +55,7 @@ read_dir <- function(path, verbose = T, print_fun = NULL, maximization = TRUE,
 #' path <- system.file("extdata", "ONE_PLUS_LAMDA_EA", package = "IOHanalyzer")
 #' DataSetList(path)
 DataSetList <- function(path = NULL, verbose = T, print_fun = NULL, maximization = NULL,
-                        format = IOHprofiler, subsampling = FALSE) {
+                        format = IOHprofiler, subsampling = FALSE, full_aggregation = TRUE) {
   if (is.null(path))
     return(structure(list(), class = c('DataSetList', 'list')))
   
@@ -164,7 +167,12 @@ DataSetList <- function(path = NULL, verbose = T, print_fun = NULL, maximization
   
   attr(object, 'suite') <- suite
   attr(object, 'maximization') <- maximization
-  clean_DataSetList(object)
+  attr(object, 'ID') <- attr(object, 'algId')
+  attr(object, 'ID_attributes') <- c('algId')
+  if (full_aggregation)
+    clean_DataSetList(object)
+  else
+    object
 }
 
 
@@ -414,13 +422,8 @@ get_ERT.DataSetList <- function(ds, ftarget, budget = NULL, algorithm = 'all', .
   }
 
 #' @rdname get_RT_summary
-#' @param algorithm DEPRECATED, will be removed in next release. Which algorithms in the DataSetList to consider. 
 #' @export
-get_RT_summary.DataSetList <- function(ds, ftarget, budget = NULL, algorithm = 'all', ...) {
-    if (!missing("algorithm")) warning("Argument 'algorithm' is deprecated and will be removed in the next release of IOHanalyzer.")
-    if (algorithm != 'all')
-      ds <- subset(ds, algId == algorithm)
-    
+get_RT_summary.DataSetList <- function(ds, ftarget, budget = NULL, ...) {
     rbindlist(lapply(ds, function(ds) {
       res <-
         cbind(attr(ds, 'DIM'),
@@ -700,47 +703,174 @@ get_runtimes <- function(dsList) {
   ))))
 }
 
-# #' Get the best function value reached in a DataSetList
-# #'
-# #' @param dsList The DataSetLsit
-# #'
-# #' @return A list matrices of all runtime values which occur in the DataSetList
-# #' @export
-# get_best_targets <- function(dsList, by = 'funcId', maximize = T) {
-#   targets <- c()
-#   funcIds <- get_funcId(dsList)
+#' Get all attributes which can be used to subset a DataSetList
+#'
+#' @param dsl The DataSetList
+#'
+#' @return The list of available attributes
+#' @export
+#' @examples
+#' get_static_attributes(dsl)
+get_static_attributes <- function(dsl) {
+  full_names <- unique(unlist(lapply(dsl, function(ds) {names(attributes(ds))})))
+  
+  reserved_attributes <- c("names", "class", "suite", "maximization", "algInfo", "comment", 
+                           "datafile", "maxRT", "finalFV", "format")
+  setdiff(full_names, reserved_attributes)
+}
 
-#   for (i in seq_along(aggr_attr)) {
-#     data <- subset(dsList, funcId == funcIds[i])
+#' Get all options for a specific attribute which can be used to subset a DataSetList
+#' 
+#' This is a more generic version of the existing `get_dim`, `get_funcId` and `get_algId` functions.
+#' Note the only attributes returned by `get_static_attributes` are supported in this funcion
+#'
+#' @param dsl The DataSetList
+#' @param attribute the name of the attribute for which to get the available options in dsl
+#' @return The list of options for the specified attribute
+#' @export
+#' @examples
+#' get_static_attribute_values(dsl, 'funcId')
+get_static_attribute_values <- function(dsl, attribute) {
+  unique(unlist(lapply(dsl, function(ds) {attr(ds, attribute)})))
+}
 
-#     Fall <- get_funvals(data)
-#     Fval <- ifelse(maximize, max(Fall), min(Fall))
-#     targets <- c(targets, Fval)
-#   }
-#   targets
-# }
-
-# TODO: the attribute list should als be sliced here...
 #' Filter a DataSetList by some criteria
 #'
-#' @param x The DataSetLsit
-#' @param ... The condition to filter on. Can be any expression which assigns True or False
-#' to a DataSet object, such as DIM == 625 or funcId == 2
+#' @param x The DataSetList
+#' @param ... The conditions to filter on. Can be any expression which assigns True or False
+#' to a DataSet object, such as DIM == 625 or funcId == 2. Usage of && and || is only supported on default attributes 
+#' (funcId, algId, DIM), not on combinations of with other attributes (e.g. instance). In those cases, & and | should 
+#' be used respectively. Alternatively, this can be used as a keyword argument named 'text', with the condition as a 
+#' string to be parsed. This allows exectution of subset commands on arbitrary variables in code. 
 #'
 #' @return The filtered DataSetList
 #' @export
 #' @examples
 #' subset(dsl, funcId == 1)
+#' subset(dsl, funcId == 1 && DIM == 16) # Can use && and || for default attributes
+#' subset(dsl, instance == 1)
+#' subset(dsl, instance == 1 & funcId == 1) # Can use & and | for all attributes
+#' subset(dsl, instance == 1, funcId == 1) # Comma-seperated conditions are treated as AND
 subset.DataSetList <- function(x, ...) {
-  condition_call <- substitute(list(...))
   enclos <- parent.frame()
-  idx <- sapply(x,
-                function(ds)
-                  all(unlist(
-                    eval(condition_call, attributes(ds), enclos)
-                  )))
-  x[idx]
+  if (hasArg('text')) {
+    text <- list(...)$text
+    condition_call <- parse(text = text)
+  } else {
+    condition_call <- substitute(list(...))
+    condition_call <- condition_call[2:length(condition_call)]
+  }
+  
+  obj <- lapply(x,
+                function(ds){
+                  mask <- tryCatch(expr = {
+                    mask <- NULL
+                    for (idx in seq(length(condition_call))) {
+                      mask_temp <- unlist(
+                        eval(condition_call[[idx]], attributes(ds), enclos = enclos)
+                      )
+                      if (is.null(mask)) mask <- mask_temp
+                      else {
+                        if (length(mask_temp) == 1 && !mask_temp) {
+                          mask <- F
+                        } else if (length(mask_temp) == 1) {
+                          mask <- mask
+                        } else if (length(mask_temp) == length(mask) || length(mask) == 1) {
+                          mask <- mask & mask_temp
+                        } else {
+                          stop("Error creating mask")
+                        }
+                        
+                      }
+                    }
+                    mask
+                  }, error = function(e) {F})
+                  
+                  if (length(mask) == 1 && mask) return(ds)
+                  else if (length(mask) == 1 || !any(mask)) return(NULL)
+                  return(subset(ds, mask))
+                })
+  
+  class(obj) <- c('DataSetList', class(obj))
+  obj <- Filter(Negate(is.null), obj)
+  
+  # also slice the attributes accordingly
+  attr(obj, 'suite') <- attr(x, 'suite')
+  attr(obj, 'maximization') <- attr(x, 'maximization')
+  attr(obj, 'DIM') <- sapply(obj, function(ds) attr(ds, 'DIM'))
+  attr(obj, 'funcId') <- sapply(obj, function(ds) attr(ds, 'funcId'))
+  attr(obj, 'algId') <- sapply(obj, function(ds) attr(ds, 'algId'))
+  unique_ids <- unlist(sapply(obj, function(ds) attr(ds, 'unique_id')))
+  if (!any(is.null(unique_ids))) {
+    attr(obj, 'unique_ids') <- unique_ids
+  }
+  return(obj)
 }
+
+#' Add unique identifiers to each DataSet in the provided DataSetList based on static attributes
+#' 
+#' Note that this function returns a new DataSetList object, since a split into new datasetlist has to be done to
+#' ensure each dataset has exactly one unique identifier.
+#' Note that only static attributes (see `get_static_attributes`) can be used to create unique identifiers. 
+#'
+#' @param dsl The DataSetList
+#' @param attrs The list of attributes to combine into a unique identifier
+#' @return A new DataSetList object where the split has been done based on the provided attributes, and the unique
+#' identifier has been added. 
+#' @export
+#' @examples
+#' change_id(dsl, c('instance'))
+change_id <- function(dsl, attrs) {
+  if (!all(attrs %in% get_static_attributes(dsl))) stop("Selected attributes are not usable to create unique ids")
+  grid <- expand.grid(lapply(attrs, function(x){get_static_attribute_values(dsl, x)}))
+  colnames(grid) <- attrs
+  
+  dsl_new <- DataSetList()
+  attr_vals <- c()
+  for (x in transpose(grid)) {
+    # conditions <- unlist(lapply(seq(length(attrs)), function(idx) {
+    #   parse(text = paste0(attrs[[idx]], ' == ', x[[idx]]))
+    # }))
+    conditions <- paste0(unlist(lapply(seq(length(attrs)), function(idx) {
+      paste0(attrs[[idx]], ' == ', x[[idx]])
+    })), collapse = " & ")
+    dsl_temp <- subset(dsl, text = conditions)
+    if (length(attrs) == 1) 
+      attr_val <- x
+    else
+      attr_val <- paste0(x, collapse = "_")
+    
+    attr_vals <- c(attr_vals, rep(attr_val, length(dsl_temp)))
+    dsl_new <- c(dsl_new, dsl_temp)
+  }
+  attr(dsl_new, 'ID_attributes') <- attrs
+  attr(dsl_new, 'ID') <- attr_vals
+  for (idx in seq(length(dsl_new))) {
+    attr(dsl_new[[idx]], 'ID') <- attr_vals[[idx]]
+  }
+  dsl_new
+}
+
+#' Get the unique identifiers for each DataSet in the provided DataSetList
+#' 
+#' If no unique identifier is set (using `change_id` or done in DataSet construction from 1.6.0 onwards), 
+#' this function falls back on returning the algorith id (from `get_aldId`)to ensure backwards compatibility
+#'
+#' @param dsl The DataSetList
+#' @return The list of unique identiefiers present in dsl
+#' @export
+#' @examples
+#' get_id(dsl)
+get_id <- function(dsl) {
+  temp <- attr(dsl, 'ID')
+  if (is.null(temp)) {
+    warning("No ID attribute set, returning the algId's instead. (from 1.6.0 onwards, ID attributes are always added
+            to new datasets, see the 'add_ID' function.")
+    return(get_algId(dsl))
+  }
+  return(unique(temp))
+}
+
 
 #' Save DataTable in multiple formats
 #' 
@@ -851,11 +981,11 @@ generate_data.Single_Function <- function(dsList, start = NULL, stop = NULL,
     Xseq <- seq_FV(all, start, stop, length.out = 60,
                    scale = ifelse(scale_log, 'log', 'linear'))
     if (include_opts) {
-      for (algid in get_algId(dsList)) {
+      for (uid in get_id(dsList)) {
         if (maximization)
-          Xseq <- c(Xseq, max(get_funvals(subset(dsList, algId == algid))))
+          Xseq <- c(Xseq, max(get_funvals(subset(dsList, ID == uid))))
         else
-          Xseq <- c(Xseq, min(get_funvals(subset(dsList, algId == algid))))
+          Xseq <- c(Xseq, min(get_funvals(subset(dsList, ID == uid))))
       }
       Xseq <- unique(sort(Xseq))
     }
@@ -865,8 +995,8 @@ generate_data.Single_Function <- function(dsList, start = NULL, stop = NULL,
     Xseq <- seq_RT(all, start, stop, length.out = 60,
                    scale = ifelse(scale_log, 'log', 'linear'))
     if (include_opts) {
-      for (algid in get_algId(dsList)) {
-        Xseq <- c(Xseq, max(get_funvals(subset(dsList, algId == algid))))
+      for (uid in get_id(dsList)) {
+        Xseq <- c(Xseq, max(get_funvals(subset(dsList, ID == uid))))
       }
       Xseq <- unique(sort(Xseq))
     }
